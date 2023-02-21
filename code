@@ -1,0 +1,136 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import shapiro, ttest_ind, mannwhitneyu, chi2_contingency
+from statsmodels.stats.proportion import proportions_ztest
+from statsmodels.stats.weightstats import DescrStatsW
+from sklearn.utils import resample
+from statsmodels.stats.power import tt_ind_solve_power
+
+class ABTest:
+    def __init__(self, file_path, metric_type):
+        self.data = pd.read_csv(file_path)
+        self.metric_type = metric_type
+        
+    def transform_data(self):
+        # Преобразование данных в соответствии с выбранной метрикой
+        if self.metric_type == 'quantitative':
+            before = self.data['before_experiment']
+            after = self.data['after_experiment']
+            # Применяем CUPED преобразование
+            mean = np.mean((before, after))
+            std = np.std((before, after))
+            before = (before - mean) / std
+            after = (after - mean) / std
+            self.data['before_experiment'] = before
+            self.data['after_experiment'] = after
+        elif self.metric_type == 'ratio':
+            group = self.data['group_type']
+            before = self.data['before_experiment']
+            after = self.data['after_experiment']
+            self.data = self.data.groupby(['group_type']).agg({'before_experiment': 'sum', 'after_experiment': 'sum'})
+            self.data['control_ratio'] = self.data['before_experiment'] / (self.data['before_experiment'] + self.data['after_experiment'])
+            self.data['test_ratio'] = self.data['after_experiment'] / (self.data['before_experiment'] + self.data['after_experiment'])
+            self.data['delta_ratio'] = self.data['test_ratio'] - self.data['control_ratio']
+            self.data['std_error'] = np.sqrt(self.data['control_ratio'] * (1 - self.data['control_ratio']) / (self.data['before_experiment'] + self.data['after_experiment']) + self.data['test_ratio'] * (1 - self.data['test_ratio']) / (self.data['before_experiment'] + self.data['after_experiment']))
+        elif self.metric_type == 'proportion':
+            group = self.data['group_type']
+            before = self.data['before_experiment']
+            after = self.data['after_experiment']
+            self.data = self.data.groupby(['group_type']).agg({'before_experiment': 'sum', 'after_experiment': 'sum'})
+            self.data['control_proportion'] = self.data['before_experiment'] / (self.data['before_experiment'] + self.data['after_experiment'])
+            self.data['test_proportion'] = self.data['after_experiment'] / (self.data['before_experiment'] + self.data['after_experiment'])
+    
+    def test(self, alpha=0.05, alternative='two-sided'):
+        n = len(self.data)
+        if n >= 30:
+            if self.metric_type == 'quantitative':
+                # Проверка нормальности распределения
+                _, p_value = shapiro(self.data['before_experiment'] - self.data['after_experiment'])
+                if p_value >= alpha:
+                # Т-тест Уэлча
+                t_stat, p_value = ttest_ind(self.data['before_experiment'], self.data['after_experiment'], equal_var=False)
+                effect_size = np.abs(DescrStatsW(self.data['before_experiment']).mean - DescrStatsW(self.data['after_experiment']).mean) / DescrStatsW(self.data['before_experiment']).std
+            elif self.metric_type == 'ratio':
+                # Применяем дельта-метод и проводим т-тест
+                diff = self.data['delta_ratio'].mean()
+                se = self.data['std_error'].mean()
+                z_stat, p_value = proportions_ztest(count=[self.data['after_experiment'].sum(), self.data['before_experiment'].sum()], nobs=[self.data['after_experiment'].sum() + self.data['before_experiment'].sum(), self.data['after_experiment'].sum() + self.data['before_experiment'].sum()], value=diff, alternative=alternative, prop_var=(self.data['control_ratio'] * self.data['test_ratio']) / (self.data['before_experiment'] + self.data['after_experiment']))
+                if alternative == 'two-sided':
+                    effect_size = diff / se
+                else:
+                    if diff < 0:
+                        effect_size = diff / self.data['std_error'].min()
+                    else:
+                        effect_size = diff / self.data['std_error'].max()
+            elif self.metric_type == 'proportion':
+                # Проверка значимости различий между пропорциями
+                chi_stat, p_value, dof, expected = chi2_contingency([self.data['after_experiment'].values, self.data['before_experiment'].values])
+                effect_size = np.sqrt(chi_stat / (self.data['after_experiment'].sum() + self.data['before_experiment'].sum()))
+                if p_value < alpha:
+                    stat_sig = True
+                else:
+                    stat_sig = False
+        else:
+            if self.metric_type == 'quantitative':
+                # Применяем bootstrap и проводим т-тест
+                control = self.data['before_experiment']
+                test = self.data['after_experiment']
+                control_mean = np.mean(control)
+                test_mean = np.mean(test)
+                diffs = []
+                for i in range(1000):
+                    control_sample = resample(control)
+                    test_sample = resample(test)
+                    control_resampled_mean = np.mean(control_sample)
+                    test_resampled_mean = np.mean(test_sample)
+                    diff = test_resampled_mean - control_resampled_mean
+                    diffs.append(diff)
+                p_value = (np.sum(diffs > (test_mean - control_mean)) + np.sum(diffs < (test_mean - control_mean))) / len(diffs)
+                effect_size = (test_mean - control_mean) / np.std(diffs)
+            elif self.metric_type == 'ratio':
+                # Применяем блочный bootstrap и проводим т-тест
+                control = self.data['before_experiment']
+                test = self.data['after_experiment']
+                control_sum = control.sum()
+                test_sum = test.sum()
+                control_ratio = control_sum / (control_sum + test_sum)
+                test_ratio = test_sum / (control_sum + test_sum)
+                data = np.concatenate([control, test])
+                block_ids = np.concatenate([np.zeros_like(control), np.ones_like(test)])
+                diffs = []
+                for i in range(1000):
+                    control_resampled = test_resampled = resample(test, n_samples=len(test), block=block_ids)
+                    control_resampled_sum = control_resampled.sum()
+                    test_resampled_sum = test_resampled.sum()
+                    control_resampled_ratio = control_resampled_sum / (control_resampled_sum + test_resampled_sum)
+                    test_resampled_ratio = test_resampled_sum / (control_resampled_sum + test_resampled_sum)
+                    diff = test_resampled_ratio - control_resampled_ratio
+                    diffs.append(diff)
+                p_value = (np.sum(diffs > (test_ratio - control_ratio)) + np.sum(diffs < (test_ratio - control_ratio))) / len(diffs)
+                effect_size = (test_ratio - control_ratio) / np.std(diffs)
+            elif self.metric_type == 'proportion':
+                # Проверка значимости различий между пропорциями
+                control = self.data['before_experiment']
+                test = self.data['after_experiment']
+                control_count = control.sum()
+                test_count = test.sum()
+                control_prop = control_count / len(control)
+                test_prop = test_count / len(test)
+                count = np.array([test_count, control_count])
+                nobs = np.array([len(test), len(control)])
+                stat, p_value = proportions_ztest(count=count, nobs=nobs, value=0, alternative=alternative)
+                if alternative == 'two-sided':
+                    effect_size = (test_prop - control_prop) / np.sqrt((control_prop * (1 - control_prop) / len(control)) + (test_prop * (1 - test_prop) / len(test)))
+                else:
+                    if test_prop < control_prop:
+                        effect_size = (test_prop - control_prop) / np.sqrt((control_prop * (1 - control_prop) / len(control)))
+                    else:
+                        effect_size = (test_prop - control_prop) / np.sqrt((test_prop * (1 - test_prop) / len(test)))
+        # Рассчитываем мощность теста
+        power = tt_ind_solve_power(effect_size=effect_size, alpha=alpha, nobs1=len(self.data) / 2, ratio=1, alternative=alternative)
+        if power < 0.8:
+            print("Невозможно зафиксировать значимость, мощность теста меньше 80%.")
+        elif p_value < alpha:
+            print("Изменение значимо.")
+        else:
+            print("Изменение не значимо.")
